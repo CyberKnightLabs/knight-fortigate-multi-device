@@ -3,14 +3,17 @@
 Hard limits enforced here (not only in the AI's instructions):
 - CPU is read before every debug / capture; unreadable CPU -> refuse (fail closed).
 - Debug: refused at CPU >= 95 %. Never an unfiltered "debug all": flow debug needs at least
-  one filter, IKE debug needs a peer or tunnel filter, application debug only for an allowlist.
+  one filter, IKE debug needs a peer or tunnel filter, BGP debug needs a neighbor, OSPF and HA debug only
+  for named categories / modules (never 'all enable'), application debug only for an allowlist.
   Every debug session ALWAYS ends with debug disable + reset (also after errors/timeouts).
 - Packet capture: refused at CPU >= 90 %; max 10 packets, or 100 when CPU < 50 %. A BPF filter
   is required. Headers only unless include_payload=True. The CLI sniffer stores no capture file;
   it is stopped (Ctrl-C) at the end of every call.
 - Time limits: debug <= 120 s, capture <= 60 s. Output is secret-redacted and size-limited.
 CLI syntax follows the FortiOS 7.6 CLI Reference (diagnose debug flow p2926-2936,
-diagnose vpn ike log filter p3679-3686, diagnose sniffer packet p3319).
+diagnose vpn ike log filter p3679-3686, diagnose sniffer packet p3319, diagnose ip router bgp p3107-3110,
+diagnose ip router ospf p3116-3119, diagnose debug application hatalk/hasync p2892). BGP set-filter syntax
+and the category enable form were checked live on FortiOS 7.6.8.
 
 Author: Ehsan Emad (CyberKnightLabs)
 """
@@ -54,7 +57,35 @@ DEBUG_APPS = {  # application debug allowlist (ike has its own tool with a filte
     "sslvpn": "SSL VPN (where still supported)",
 }
 
+BGP_CATEGORIES = {  # diagnose ip router bgp <category> enable ("all" is never enabled)
+    "fsm": "neighbor state machine (Idle/Connect/Active/OpenSent/Established)",
+    "events": "BGP events (session up/down, notifications)",
+    "updates": "UPDATE messages (prefixes received / sent)",
+    "keepalives": "KEEPALIVE messages (hold timer problems)",
+    "filters": "route-map / prefix-list / filter decisions",
+    "dampening": "route dampening",
+    "nsm": "interaction with the routing table (NSM)",
+}
+OSPF_CATEGORIES = {  # diagnose ip router ospf <category> enable ("all" is never enabled)
+    "nfsm": "neighbor state machine (Down/Init/2-Way/ExStart/Exchange/Full)",
+    "ifsm": "interface state machine (DR/BDR election)",
+    "events": "OSPF events",
+    "packet": "OSPF packets (hello, DD, LSR, LSU, LSAck): verbose",
+    "lsa": "LSA generation and flooding",
+    "route": "SPF / route calculation",
+    "nsm": "interaction with the routing table (NSM)",
+}
+ROUTER_LEVELS = ("info", "warn", "error", "critical")
+HA_MODULES = {
+    "hatalk": "HA protocol: heartbeat, primary election, failover",
+    "hasync": "HA synchronization: configuration and session sync",
+}
+
 CLEANUP_DEBUG = ["diagnose debug disable", "diagnose debug reset"]
+CLEANUP_BGP = ["diagnose ip router bgp all disable", "diagnose ip router bgp level none",
+               "diagnose ip router bgp set-filter reset"]
+CLEANUP_OSPF = ["diagnose ip router ospf all disable", "diagnose ip router ospf level none"]
+CLEANUP_HA = ["diagnose debug application hatalk 0", "diagnose debug application hasync 0"]
 CLEANUP_FLOW = ["diagnose debug flow trace stop", "diagnose debug flow filter clear", *CLEANUP_DEBUG]
 CLEANUP_IKE = ["diagnose debug application ike 0", "diagnose vpn ike log filter clear", *CLEANUP_DEBUG]
 
@@ -62,7 +93,8 @@ READ_ONLY_PREFIXES = (
     "get system status", "get system performance status", "get system ha status", "get system interface",
     "get system arp", "get router info ", "get router info6 ", "get hardware ", "get vpn ipsec ",
     "get firewall ", "diagnose sys session list", "diagnose sys session stat", "diagnose sys ha status",
-    "diagnose sys ha checksum", "diagnose sys top-summary", "diagnose sys mpstat", "diagnose hardware deviceinfo",
+    "diagnose sys ha checksum show", "diagnose sys ha checksum cluster",  # not "recalculate"
+    "diagnose sys top-summary", "diagnose sys mpstat", "diagnose hardware deviceinfo",
     "diagnose vpn ike gateway list", "diagnose vpn tunnel list", "diagnose ip arp list", "diagnose ip route list",
     "diagnose firewall iprope list", "diagnose netlink interface list", "diagnose sys virtual-wan-link",
     "diagnose sys sdwan", "diagnose test authserver", "execute ping ", "execute traceroute ",
@@ -112,6 +144,18 @@ def _name(value: str, what: str, size: int = 35) -> str:
     if not re.fullmatch(rf"[\w.\-]{{1,{size}}}", value or ""):
         raise ValueError(f"invalid {what}: {value!r}")
     return value
+
+
+def _categories(values: list[str] | None, allowed: dict[str, str], default: list[str], what: str) -> list[str]:
+    cats = [str(v).strip().lower() for v in (values or default)]
+    if not cats:
+        raise ValueError(f"at least one {what} category is required")
+    if "all" in cats:
+        raise ValueError(f"'all' is never enabled (no unfiltered debug); pick categories from: {', '.join(allowed)}")
+    bad = [c for c in cats if c not in allowed]
+    if bad:
+        raise ValueError(f"unknown {what} categor{'y' if len(bad) == 1 else 'ies'} {bad}; allowed: {', '.join(allowed)}")
+    return list(dict.fromkeys(cats))
 
 
 def _bpf(value: str) -> str:
@@ -379,6 +423,122 @@ def register(mcp: FastMCP) -> None:
         return {**extra, **_ctx_report(c), "cpu_before": cpu, "filter": filt, "seconds": seconds, "output": out,
                 "truncated": cut or r.truncated, "debug_disabled_after": r.cleanup_ok, "cleanup_commands": cleanup}
 
+    async def _router_debug(ctx: Context, proto: str, cats: list[str], level: str, seconds: int,
+                            vdom: str | None, extra_setup: list[str], cleanup_cmds: list[str],
+                            report: dict[str, Any]) -> dict[str, Any]:
+        client, ssh = _ctx(ctx)
+        if level not in ROUTER_LEVELS:
+            return {"refused": True, "reason": f"level must be one of {', '.join(ROUTER_LEVELS)}"}
+        seconds = max(5, min(int(seconds), DEBUG_MAX_SECONDS))
+        try:
+            c = await resolve_context(client, vdom, "vdom")  # routing daemons run per VDOM
+        except ValueError as exc:
+            return {"refused": True, "reason": str(exc)}
+        cpu, refused = await _gate(client, c.get("vdom"), DEBUG_CPU_MAX, "debug")
+        if refused:
+            return refused
+        setup = ["diagnose debug reset", *cleanup_cmds, "diagnose debug console timestamp enable", *extra_setup,
+                 *[f"diagnose ip router {proto} {cat} enable" for cat in cats],
+                 f"diagnose ip router {proto} level {level}", "diagnose debug enable"]
+        setup, cleanup = _wrap(c, setup, [*cleanup_cmds, *CLEANUP_DEBUG])
+        try:
+            r = await ssh.run_session(setup, seconds, cleanup)
+        except SSHNotConfigured as exc:
+            return {"error": str(exc)}
+        out, cut = _trim(r.output)
+        extra: dict[str, Any] = {"error": r.error} if r.error else {}
+        if CONTEXT_ERROR.search(r.output) or "Command fail" in r.output:
+            extra["warning"] = f"the CLI rejected a 'diagnose ip router {proto}' command; check the output"
+        return {**extra, **_ctx_report(c), "cpu_before": cpu, **report, "level": level, "seconds": seconds,
+                "output": out, "truncated": cut or r.truncated, "debug_disabled_after": r.cleanup_ok,
+                "cleanup_commands": cleanup}
+
+    @mcp.tool()
+    async def debug_bgp(
+        ctx: Context,
+        neighbor: Annotated[str, Field(description="BGP neighbor IP to debug (required: the debug is filtered to it).")],
+        categories: Annotated[list[str] | None, Field(default=None, description="Any of: " + ", ".join(
+            f"{k} ({v})" for k, v in BGP_CATEGORIES.items()) + ". Default: fsm, events.")] = None,
+        level: Annotated[str, Field(default="info", description="info, warn, error or critical.")] = "info",
+        seconds: Annotated[int, Field(default=60, description=f"Collection time (5-{DEBUG_MAX_SECONDS} s).")] = 60,
+        vdom: Annotated[str | None, Field(default=None, description="VDOM where BGP runs.")] = None,
+    ) -> dict[str, Any]:
+        """BGP real-time debug filtered to ONE neighbor (diagnose ip router bgp set-filter neighbor <ip>).
+        Read first: get router info bgp summary / neighbors and the event log. Ask the user to reproduce (e.g.
+        wait for the flap, or clear the session themselves) during the collection time. BGP debug categories,
+        level and the neighbor filter are always reset and debug disabled at the end."""
+        try:
+            nb = _ip(neighbor)
+            cats = _categories(categories, BGP_CATEGORIES, ["fsm", "events"], "BGP")
+        except ValueError as exc:
+            return {"refused": True, "reason": str(exc)}
+        return await _router_debug(ctx, "bgp", cats, (level or "info").lower(), seconds, vdom,
+                                   [f"diagnose ip router bgp set-filter neighbor {nb}"], CLEANUP_BGP,
+                                   {"neighbor": nb, "categories": cats})
+
+    @mcp.tool()
+    async def debug_ospf(
+        ctx: Context,
+        categories: Annotated[list[str] | None, Field(default=None, description="Any of: " + ", ".join(
+            f"{k} ({v})" for k, v in OSPF_CATEGORIES.items()) + ". Default: nfsm, events.")] = None,
+        level: Annotated[str, Field(default="info", description="info, warn, error or critical.")] = "info",
+        seconds: Annotated[int, Field(default=60, description=f"Collection time (5-{DEBUG_MAX_SECONDS} s).")] = 60,
+        vdom: Annotated[str | None, Field(default=None, description="VDOM where OSPF runs.")] = None,
+    ) -> dict[str, Any]:
+        """OSPF real-time debug for named categories only ('all' is refused). FortiOS has no per-neighbor OSPF
+        debug filter, so pick the narrowest categories (nfsm for adjacency problems; 'packet' is verbose).
+        Read first: get router info ospf neighbor / interface / database. OSPF debug categories and level are
+        always reset and debug disabled at the end."""
+        try:
+            cats = _categories(categories, OSPF_CATEGORIES, ["nfsm", "events"], "OSPF")
+        except ValueError as exc:
+            return {"refused": True, "reason": str(exc)}
+        return await _router_debug(ctx, "ospf", cats, (level or "info").lower(), seconds, vdom, [], CLEANUP_OSPF,
+                                   {"categories": cats})
+
+    @mcp.tool()
+    async def debug_ha(
+        ctx: Context,
+        module: Annotated[str, Field(description="One of: " + ", ".join(f"{k} ({v})" for k, v in HA_MODULES.items()))],
+        seconds: Annotated[int, Field(default=60, description=f"Collection time (5-{DEBUG_MAX_SECONDS} s).")] = 60,
+    ) -> dict[str, Any]:
+        """HA debug for one module (diagnose debug application hatalk|hasync -1), in the global context.
+        Read first: get system ha status, diagnose sys ha checksum cluster and the HA event log. Refused on a
+        standalone unit. Never trigger a failover to 'test' it. Debug is always disabled and reset at the end."""
+        client, ssh = _ctx(ctx)
+        mod = (module or "").strip().lower()
+        if mod not in HA_MODULES:
+            return {"refused": True, "reason": f"'{module}' is not an HA debug module", "allowed": HA_MODULES}
+        try:
+            ha = await client.cmdb_get("system/ha")
+            res = ha.get("results", {})
+            ha_mode = (res[0] if isinstance(res, list) and res else res).get("mode", "unknown")
+        except FortiOSError:
+            ha_mode = "unknown"
+        if ha_mode == "standalone":
+            return {"refused": True, "ha_mode": ha_mode,
+                    "reason": "this unit is standalone (HA not configured): an HA debug would show nothing"}
+        seconds = max(5, min(int(seconds), DEBUG_MAX_SECONDS))
+        try:
+            c = await resolve_context(client, None, "global")
+        except ValueError as exc:
+            return {"refused": True, "reason": str(exc)}
+        cpu, refused = await _gate(client, None, DEBUG_CPU_MAX, "debug")
+        if refused:
+            return refused
+        setup = ["diagnose debug reset", "diagnose debug console timestamp enable",
+                 f"diagnose debug application {mod} -1", "diagnose debug enable"]
+        setup, cleanup = _wrap(c, setup, [*CLEANUP_HA, *CLEANUP_DEBUG])
+        try:
+            r = await ssh.run_session(setup, seconds, cleanup)
+        except SSHNotConfigured as exc:
+            return {"error": str(exc)}
+        out, cut = _trim(r.output)
+        extra = {"error": r.error} if r.error else {}
+        return {**extra, **_ctx_report(c), "ha_mode": ha_mode, "cpu_before": cpu, "module": mod, "seconds": seconds,
+                "output": out, "truncated": cut or r.truncated, "debug_disabled_after": r.cleanup_ok,
+                "cleanup_commands": cleanup}
+
     @mcp.tool()
     async def debug_application(
         ctx: Context,
@@ -468,11 +628,14 @@ def register(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def debug_reset(ctx: Context, vdom: Annotated[str | None, Field(default=None)] = None) -> dict[str, Any]:
-        """Emergency cleanup: stop any flow trace, clear debug/IKE filters, disable and reset all debug.
+        """Emergency cleanup: stop any flow trace, clear debug/IKE/BGP filters, turn off BGP/OSPF/HA debug,
+        disable and reset all debug.
         Safe to run any time; call it after troubleshooting if anything may still be running."""
         client, ssh = _ctx(ctx)
         cleanup = ["diagnose debug flow trace stop", "diagnose debug flow filter clear",
-                   "diagnose debug application ike 0", "diagnose vpn ike log filter clear", *CLEANUP_DEBUG]
+                   "diagnose debug application ike 0", "diagnose vpn ike log filter clear",
+                   *CLEANUP_BGP, *CLEANUP_OSPF, *CLEANUP_HA, *CLEANUP_DEBUG]
+        # routing lines fail harmlessly in the global context, HA lines in a VDOM context
         try:
             mode, names = await vdom_info(client)
         except FortiOSError:

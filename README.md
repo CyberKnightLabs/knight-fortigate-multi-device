@@ -14,11 +14,12 @@ Knight adds device enrollment, credential-manager integration, AI client setup a
 
 ## What's new: SSH module
 
-The server now also connects to each FortiGate over **SSH**, for the troubleshooting work the REST API cannot do: flow / IKE / application debug, packet capture and read-only `diagnose` commands (see [Diagnostics over SSH](#diagnostics-over-ssh-debug-and-packet-capture)).
+The server now also connects to each FortiGate over **SSH**, for the troubleshooting work the REST API cannot do: flow / IKE / BGP / OSPF / HA / application debug, packet capture and read-only `diagnose` commands (see [Diagnostics over SSH](#diagnostics-over-ssh-debug-and-packet-capture)).
 
 - **Wizard:** *Add FortiGate Device* now asks for the SSH port, username and password (hidden) right after the API settings; you can skip it and add it later.
 - **Manage FortiGate Devices:** new *Configure SSH Access*, *Change SSH Password* (when the password changed on the firewall) and *Remove SSH Access*; the device list shows the SSH status.
 - **Secure storage:** the SSH password is kept only in the OS credential store (macOS Keychain, Windows Credential Manager or a Linux keyring backend), never in the JSON file or a client config. It is saved only after a test login succeeds, pinned to the SSH host key you confirmed.
+- **Routing and HA debug:** `debug_bgp` (filtered to one neighbor), `debug_ospf` (named categories only) and `debug_ha` (`hatalk` or `hasync`), all CPU-gated and always turned off at the end.
 - **Safety limits in code:** CPU checks before every debug or capture, no unfiltered debug, packet limits, time limits, debug always turned off at the end, multi-VDOM aware.
 
 ## Contents
@@ -347,7 +348,7 @@ See [the generated tool reference](docs/TOOLS.md) for every registered function 
 | Module | Purpose |
 |---|---|
 | `extended` | `device_info` (live model, serial, FortiOS version/build), `cmdb_schema` (field schema reported by the device, `?action=schema`), `cmdb_patch` (change only the given fields: dry-run diff by default, then write and read-back verification), `cmdb_exists`, `cmdb_move` (reorder any ordered table), `cmdb_clone` (`action=clone`), `api_directory` (discover endpoints on the device), `log_search` (POST log queries) |
-| `diagnostics` | Over SSH: `cpu_usage`, `diag_command` (read-only allowlist), `debug_flow`, `debug_ike`, `debug_application`, `packet_capture`, `debug_reset`, with CPU gates and guaranteed cleanup (see below) |
+| `diagnostics` | Over SSH: `cpu_usage`, `diag_command` (read-only allowlist), `debug_flow`, `debug_ike`, `debug_bgp`, `debug_ospf`, `debug_ha`, `debug_application`, `packet_capture`, `debug_reset`, with CPU gates and guaranteed cleanup (see below) |
 | `generic` | CMDB list/get/create/update/delete; monitor reads/actions; logs; service calls |
 | `system` | Interfaces, DNS, NTP, administrators, DHCP, certificates, VDOMs and system status |
 | `firewall` | Policies, addresses, groups, services, VIPs, IP pools, schedules and sessions |
@@ -402,21 +403,31 @@ Limits enforced in code:
 | Debug refused | CPU ≥ 95 % |
 | Packet capture refused | CPU ≥ 90 % |
 | Packet capture size | max 10 packets; max 100 when CPU < 50 % |
-| No unfiltered debug | flow debug needs an address/port/protocol filter; IKE debug needs a peer or tunnel; application debug only for an allowlist |
+| No unfiltered debug | flow debug needs an address/port/protocol filter; IKE debug needs a peer or tunnel; BGP debug needs one neighbor (`set-filter neighbor`); OSPF debug only named categories (FortiOS has no OSPF neighbor filter); HA debug one module (`hatalk` or `hasync`), refused on a standalone unit; `all enable` is never used; application debug only for an allowlist |
 | Capture filter | required; headers only (verbose 1/4) unless `include_payload=true` |
 | Duration | debug ≤ 120 s, capture ≤ 60 s |
-| Cleanup | every debug ends with `diagnose debug disable` + `diagnose debug reset` (and flow/IKE filter clear), also after errors or timeouts, retried on a new connection if the session broke; the sniffer is stopped with Ctrl-C; the CLI sniffer stores no capture file |
+| Cleanup | every debug ends with `diagnose debug disable` + `diagnose debug reset` (and flow/IKE/BGP filter clear, BGP/OSPF categories and level reset, HA modules off), also after errors or timeouts, retried on a new connection if the session broke; the sniffer is stopped with Ctrl-C; the CLI sniffer stores no capture file |
 | Output | secret-redacted (ENC values, SA keys, `password=`/`psk=`), max 2000 lines |
 
 **Multi-VDOM devices.** In multi-VDOM mode almost no `diagnose` command works at the top-level prompt. The tools read the VDOM mode and VDOM list over REST and run each command in the right context (tested on FortiOS 7.6.8):
 
 | Runs in | Commands |
 |---|---|
-| VDOM (`config vdom` / `edit <vdom>`) | flow debug, IKE debug and `diagnose vpn ike log filter`, routing table, VPN tunnel/gateway lists, ARP, iprope, netlink interface list |
-| Global (`config global`) | `get system performance status`, `get system ha status`, hardware, autoupdate versions |
+| VDOM (`config vdom` / `edit <vdom>`) | flow debug, IKE debug and `diagnose vpn ike log filter`, BGP and OSPF debug, routing table, VPN tunnel/gateway lists, ARP, iprope, netlink interface list |
+| Global (`config global`) | HA debug, `get system performance status`, `get system ha status`, `diagnose sys ha checksum show/cluster`, hardware, autoupdate versions |
 | VDOM if given, else global | application debug, packet capture |
 
 Without `vdom=` a VDOM-scoped command uses the device's default VDOM and says so in the result. A VDOM name that does not exist is refused before anything runs (in `config vdom`, `edit <new name>` would create a VDOM). A read-only command rejected in one context is retried once in the other. Cleanup commands re-enter their context themselves, so they also work on a fresh connection, and `debug_reset` clears debug in global and in every VDOM. If a daemon does not exist on a model (for example `wad` on 2 GB RAM models without proxy inspection), the result says so.
+
+**Routing and HA debug.** Read first (`get router info bgp summary`, `get router info ospf neighbor`, `get system ha status`, `diagnose sys ha checksum cluster`, event logs); debug only when that does not explain it:
+
+| Tool | Filter / scope | Default | Cleanup |
+|---|---|---|---|
+| `debug_bgp` | one `neighbor` IP (required), categories `fsm`, `events`, `updates`, `keepalives`, `filters`, `dampening`, `nsm` | `fsm` + `events`, level `info` | `bgp all disable`, `level none`, `set-filter reset` |
+| `debug_ospf` | categories `nfsm`, `ifsm`, `events`, `packet` (verbose), `lsa`, `route`, `nsm` | `nfsm` + `events`, level `info` | `ospf all disable`, `level none` |
+| `debug_ha` | module `hatalk` (heartbeat, election, failover) or `hasync` (config/session sync) | none: module required | both modules `0` |
+
+The read-only allowlist accepts only `diagnose sys ha checksum show` and `cluster`, not `recalculate`.
 
 Use is interactive: the AI asks you to generate the traffic, then calls the tool, which collects output for the stated time. `debug_reset` is an emergency cleanup that works even at high CPU. Command syntax follows the FortiOS 7.6 CLI Reference; test on a lab device first.
 

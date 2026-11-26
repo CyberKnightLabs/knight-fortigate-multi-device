@@ -23,12 +23,14 @@ def tool(name):
 class FakeClient:
     vdom = "root"
 
-    def __init__(self, cpu, mode="no-vdom", vdoms=("root",)):
-        self.cpu, self.mode, self.vdoms = cpu, mode, list(vdoms)
+    def __init__(self, cpu, mode="no-vdom", vdoms=("root",), ha_mode="a-p"):
+        self.cpu, self.mode, self.vdoms, self.ha_mode = cpu, mode, list(vdoms), ha_mode
 
     async def cmdb_get(self, path, params=None, vdom=None, raw=False):
         if path == "system/global":
             return {"results": {"vdom-mode": self.mode}}
+        if path == "system/ha":
+            return {"results": {"mode": self.ha_mode}}
         assert path == "system/vdom"
         return {"results": [{"name": v} for v in self.vdoms]}
 
@@ -51,9 +53,9 @@ class FakeSSH:
         return SessionResult(output=self.output, cleanup_ok=True, commands=setup + cleanup)
 
 
-def ctx(cpu=10, ssh=None, mode="no-vdom", vdoms=("root",)):
+def ctx(cpu=10, ssh=None, mode="no-vdom", vdoms=("root",), ha_mode="a-p"):
     return SimpleNamespace(request_context=SimpleNamespace(
-        lifespan_context={"client": FakeClient(cpu, mode, vdoms), "ssh": ssh or FakeSSH()}))
+        lifespan_context={"client": FakeClient(cpu, mode, vdoms, ha_mode), "ssh": ssh or FakeSSH()}))
 
 
 MULTI = {"mode": "multi-vdom", "vdoms": ("root", "Mina-VDOM1")}
@@ -319,3 +321,71 @@ async def test_debug_reset_covers_global_and_every_vdom():
     ssh = FakeSSH()
     r = await tool("debug_reset")(ctx(99, ssh, **MULTI))
     assert [c["context"] for c in r["contexts"]] == ["global", "vdom root", "vdom Mina-VDOM1"] and r["debug_disabled"]
+
+
+# ── BGP / OSPF / HA debug ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bgp_debug_needs_neighbor_and_is_filtered_and_cleaned():
+    assert (await tool("debug_bgp")(ctx(), neighbor="not-an-ip"))["refused"]
+    ssh = FakeSSH()
+    r = await tool("debug_bgp")(ctx(ssh=ssh), neighbor="10.0.0.2", seconds=30)
+    s, c = ssh.calls[0]["setup"], ssh.calls[0]["cleanup"]
+    assert "diagnose ip router bgp set-filter neighbor 10.0.0.2" in s
+    assert "diagnose ip router bgp fsm enable" in s and "diagnose ip router bgp events enable" in s
+    assert "diagnose ip router bgp level info" in s and s[-1] == "diagnose debug enable"
+    assert not any("bgp all enable" in x for x in s)
+    for cmd in ("diagnose ip router bgp all disable", "diagnose ip router bgp level none",
+                "diagnose ip router bgp set-filter reset", "diagnose debug disable", "diagnose debug reset"):
+        assert cmd in c
+    assert r["neighbor"] == "10.0.0.2" and r["categories"] == ["fsm", "events"] and r["debug_disabled_after"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,kw", [("debug_bgp", {"neighbor": "10.0.0.2"}), ("debug_ospf", {})])
+async def test_router_debug_refuses_all_unknown_and_bad_level(tool_name, kw):
+    for bad in (["all"], ["fsm", "ALL"], ["bogus"]):
+        assert (await tool(tool_name)(ctx(), categories=bad, **kw))["refused"]
+    assert (await tool(tool_name)(ctx(), level="debug", **kw))["refused"]
+    assert (await tool(tool_name)(ctx(cpu=96), **kw))["refused"]
+
+
+@pytest.mark.asyncio
+async def test_ospf_debug_categories_and_cleanup_in_vdom():
+    ssh = FakeSSH()
+    r = await tool("debug_ospf")(ctx(ssh=ssh, **MULTI), categories=["nfsm", "ifsm"], vdom="Mina-VDOM1")
+    s, c = ssh.calls[0]["setup"], ssh.calls[0]["cleanup"]
+    assert s[:2] == ["config vdom", "edit Mina-VDOM1"]
+    assert "diagnose ip router ospf nfsm enable" in s and "diagnose ip router ospf ifsm enable" in s
+    assert c[:3] == ["end", "config vdom", "edit Mina-VDOM1"]
+    assert "diagnose ip router ospf all disable" in c and "diagnose ip router ospf level none" in c
+    assert r["context"] == "vdom Mina-VDOM1"
+
+
+@pytest.mark.asyncio
+async def test_ha_debug_module_allowlist_standalone_and_global_context():
+    assert (await tool("debug_ha")(ctx(), module="all"))["refused"]
+    assert (await tool("debug_ha")(ctx(ha_mode="standalone"), module="hatalk"))["refused"]
+    ssh = FakeSSH()
+    r = await tool("debug_ha")(ctx(ssh=ssh, **MULTI), module="hasync")
+    s, c = ssh.calls[0]["setup"], ssh.calls[0]["cleanup"]
+    assert s[0] == "config global" and "diagnose debug application hasync -1" in s
+    assert "diagnose debug application hatalk 0" in c and "diagnose debug application hasync 0" in c
+    assert r["context"] == "global" and r["debug_disabled_after"]
+
+
+@pytest.mark.asyncio
+async def test_debug_reset_also_turns_off_routing_and_ha_debug():
+    ssh = FakeSSH()
+    await tool("debug_reset")(ctx(ssh=ssh))
+    c = ssh.calls[0]["cleanup"]
+    for cmd in ("diagnose ip router bgp all disable", "diagnose ip router bgp set-filter reset",
+                "diagnose ip router ospf all disable", "diagnose debug application hatalk 0"):
+        assert cmd in c
+
+
+@pytest.mark.asyncio
+async def test_ha_checksum_recalculate_is_not_read_only():
+    r = await tool("diag_command")(ctx(), command="diagnose sys ha checksum recalculate")
+    assert r["refused"]

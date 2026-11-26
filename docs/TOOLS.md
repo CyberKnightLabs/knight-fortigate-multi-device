@@ -2,6 +2,71 @@
 
 Generated from the registered source functions. Refer to source signatures for parameters and defaults. API permissions and firmware determine availability.
 
+All responses are secret-redacted (`<REDACTED>`); requests containing `<REDACTED>` are refused.
+
+## diagnostics (7 tools, SSH)
+
+Need SSH set up with `ssh_setup.py`. CPU is read before each debug/capture (debug refused at ≥ 95 %, capture at ≥ 90 %). Output is redacted and limited to 2000 lines.
+
+### `cpu_usage`
+Current CPU % and which debug/capture limits apply right now.
+
+### `diag_command`
+One read-only CLI command from an allowlist (`get system status`, `get router info ...`, `diagnose sys session list`, `diagnose vpn tunnel list`, `diagnose vpn ike gateway list`, `execute ping`, ...). `| grep` allowed; no chaining, no config, no debug.
+
+### `debug_flow`
+`diagnose debug flow` with at least one filter (`addr`, `saddr`, `daddr`, `port`, `dport`, `proto`), up to 100 packets and 120 s. Always ends with trace stop, filter clear, debug disable and reset.
+
+### `debug_ike`
+IKE debug filtered by `rem_addr4` or `tunnel_name` (`diagnose vpn ike log filter ...`), up to 120 s. Always ends with `diagnose debug application ike 0`, IKE filter clear, debug disable and reset.
+
+### `debug_application`
+`diagnose debug application <app> -1` for an allowlist (fnbamd, authd, fssod, update, forticldd, csfd, fgfmd, dnsproxy, wad, httpsd, dhcps, dhcpc, sslvpn). Always ends with level 0, debug disable and reset.
+
+### `packet_capture`
+`diagnose sniffer packet <intf> '<filter>' <verbose> <count> l` with a required BPF filter. Max 10 packets, 100 when CPU < 50 %; refused at ≥ 90 %. Verbose 1/4 by default; payload levels need `include_payload=true`. Stopped with Ctrl-C at the end; no capture file is stored.
+
+### `debug_reset`
+Stops any flow trace, clears debug and IKE filters, disables and resets debug. Works at any CPU.
+
+## extended (8 tools)
+
+### `device_info`
+
+Live identity of the connected FortiGate: hostname, model, serial, FortiOS version and build, read from `/api/v2/monitor/system/status`. Use this instead of assuming a firmware version.
+
+### `cmdb_schema`
+
+Field schema of a CMDB endpoint as reported by the device (`GET /api/v2/cmdb/{path}?action=schema`): field names, types, options, sizes and defaults for its exact model and FortiOS version. Optional `field` returns one field's full schema; unknown field names return suggestions.
+
+### `cmdb_patch`
+
+Change only the given fields of one CMDB object. Reads the current object, rejects unknown fields, returns the diff (`dry_run=true`, default). With `dry_run=false` it writes only the changed fields, reads the object back and returns `verification` with `verified`, `not_applied` and `unexpected_changes`. Secret values are never shown and `<REDACTED>` cannot be written.
+
+### `cmdb_exists`
+
+Return `exists: true/false` for one CMDB object without returning its content (a 404 means false).
+
+### `cmdb_move`
+
+Reorder any ordered CMDB table (firewall policies, local-in policies, policy routes, SD-WAN rules) with `PUT ?action=move&before|after=<key>`. The key field is read from the schema. Dry run by default (shows current positions); with `dry_run=false` it moves and reads the order back to verify.
+
+### `cmdb_clone`
+
+Copy an object to a new key with `POST ?action=clone&nkey=<new_key>`. Checks that the source exists and the new key is free; dry run by default; verifies the copy exists after writing.
+
+### `api_directory`
+
+`GET /api/v2/{section}/{path}` for `cmdb`, `monitor`, `log` or `service`, to discover endpoints on the device when no dedicated tool exists. The response format depends on the FortiOS version.
+
+### `log_search`
+
+`POST /api/v2/log/{log_path}` with a JSON body for log endpoints that take one. For simple filtered reads use `log_get`. Output is redacted.
+
+### `cmdb_get` / `cmdb_list` `params`
+
+Optional JSON object of read options: `datasource`, `with_meta`, `with_contents_hash`, `skip`, `exclude-default-values`, `scope`, `key`, `pattern`, `format`, `filter`, `start`, `count`, `action` (`default`/`meta`/`schema`/`revision`). Other keys are refused.
+
 ## firewall (37 tools)
 
 ### `firewall_policy_list`

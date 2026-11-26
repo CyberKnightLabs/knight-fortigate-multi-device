@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from redaction import contains_redaction_marker, redact
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,12 +50,15 @@ class FortiOSClient:
         vdom: str = "root",
         verify_ssl: bool = False,
         timeout: float = 30.0,
+        redact_output: bool = True,
     ) -> None:
         self.host = host.rstrip("/")
         self.api_token = api_token
         self.vdom = vdom
         self.verify_ssl = verify_ssl
         self.timeout = timeout
+        # Replace secret values (passwords, PSKs, keys, ENC values) in every response.
+        self.redact_output = redact_output
         self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
@@ -101,8 +106,22 @@ class FortiOSClient:
             params.update({k: v for k, v in extra.items() if v is not None})
         return params
 
-    def _check_response(self, resp: httpx.Response) -> dict[str, Any]:
-        """Parse and validate a FortiOS JSON response."""
+    @staticmethod
+    def _check_request(body: Any) -> None:
+        """Refuse to send a redacted placeholder back to the device."""
+        if body is not None and contains_redaction_marker(body):
+            raise FortiOSError(
+                "Request contains '<REDACTED>'. A redacted secret cannot be written back; "
+                "leave the field out so the device keeps its current value.",
+                400,
+            )
+
+    def _check_response(self, resp: httpx.Response, raw: bool = False) -> dict[str, Any]:
+        """Parse and validate a FortiOS JSON response.
+
+        Secrets are redacted unless ``raw`` is True (internal use only, never
+        returned to the AI client).
+        """
         try:
             body: dict[str, Any] = resp.json()
         except Exception as exc:
@@ -111,14 +130,17 @@ class FortiOSClient:
                 resp.status_code,
             ) from exc
 
+        if self.redact_output and not raw:
+            body = redact(body)
+
         http_status: int = body.get("http_status", resp.status_code)
         if resp.status_code >= 400 or http_status >= 400:
             status_msg = body.get("status", "error")
-            error_msg = body.get("cli_error", body.get("http_method", str(body)))
+            error_msg = body.get("cli_error", body.get("http_method", str(redact(body))))
             raise FortiOSError(
                 f"FortiOS API error {http_status}: {status_msg} — {error_msg}",
                 http_status,
-                body,
+                redact(body),
             )
         return body
 
@@ -131,12 +153,16 @@ class FortiOSClient:
         path: str,
         params: dict[str, Any] | None = None,
         vdom: str | None = None,
+        raw: bool = False,
     ) -> dict[str, Any]:
-        """GET /api/v2/cmdb/{path} — retrieve configuration."""
+        """GET /api/v2/cmdb/{path} — retrieve configuration.
+
+        ``raw=True`` skips redaction; only for internal read-modify-write logic.
+        """
         client = self._client_guard()
         url = f"{self._BASE}/cmdb/{path.lstrip('/')}"
         resp = await client.get(url, params=self._vdom_params(params, vdom))
-        return self._check_response(resp)
+        return self._check_response(resp, raw=raw)
 
     async def cmdb_post(
         self,
@@ -146,6 +172,7 @@ class FortiOSClient:
         vdom: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/v2/cmdb/{path} — create a configuration object."""
+        self._check_request(body)
         client = self._client_guard()
         url = f"{self._BASE}/cmdb/{path.lstrip('/')}"
         resp = await client.post(url, json=body, params=self._vdom_params(params, vdom))
@@ -159,6 +186,7 @@ class FortiOSClient:
         vdom: str | None = None,
     ) -> dict[str, Any]:
         """PUT /api/v2/cmdb/{path} — replace a configuration object."""
+        self._check_request(body)
         client = self._client_guard()
         url = f"{self._BASE}/cmdb/{path.lstrip('/')}"
         resp = await client.put(url, json=body, params=self._vdom_params(params, vdom))
@@ -174,6 +202,33 @@ class FortiOSClient:
         client = self._client_guard()
         url = f"{self._BASE}/cmdb/{path.lstrip('/')}"
         resp = await client.delete(url, params=self._vdom_params(params, vdom))
+        return self._check_response(resp)
+
+    async def section_get(
+        self,
+        section: str,
+        path: str = "",
+        params: dict[str, Any] | None = None,
+        vdom: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        """GET /api/v2/{section}/{path} — used for API directory discovery.
+
+        Some directory responses are a JSON list instead of an object.
+        """
+        if section not in ("cmdb", "monitor", "log", "service"):
+            raise FortiOSError(f"unknown API section '{section}'", 400)
+        client = self._client_guard()
+        url = f"{self._BASE}/{section}/{path.lstrip('/')}"
+        resp = await client.get(url, params=self._vdom_params(params, vdom))
+        try:
+            body = resp.json()
+        except Exception as exc:
+            raise FortiOSError(f"Non-JSON response (HTTP {resp.status_code}): {resp.text[:300]}",
+                               resp.status_code) from exc
+        if isinstance(body, list):
+            if resp.status_code >= 400:
+                raise FortiOSError(f"FortiOS API error {resp.status_code}", resp.status_code)
+            return redact(body) if self.redact_output else body
         return self._check_response(resp)
 
     # ------------------------------------------------------------------
@@ -200,6 +255,7 @@ class FortiOSClient:
         vdom: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/v2/monitor/{path} — trigger a monitor action."""
+        self._check_request(body)
         client = self._client_guard()
         url = f"{self._BASE}/monitor/{path.lstrip('/')}"
         resp = await client.post(
@@ -231,6 +287,7 @@ class FortiOSClient:
         vdom: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/v2/log/{path} — start a log search or action."""
+        self._check_request(body)
         client = self._client_guard()
         url = f"{self._BASE}/log/{path.lstrip('/')}"
         resp = await client.post(
@@ -262,6 +319,7 @@ class FortiOSClient:
         vdom: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/v2/service/{path}."""
+        self._check_request(body)
         client = self._client_guard()
         url = f"{self._BASE}/service/{path.lstrip('/')}"
         resp = await client.post(

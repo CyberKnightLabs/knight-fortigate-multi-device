@@ -1,7 +1,7 @@
 [project]
 name = "knight-fortigate-multi-device"
 version = "1.0.0"
-description = "MCP Server for Fortinet FortiOS 7.6.6 REST API"
+description = "MCP Server for Fortinet FortiOS 7.x REST API (built against 7.6.6)"
 authors = [
     {name = "Ehsan Emad"}
 ]
@@ -28,6 +28,7 @@ dependencies = [
     "pydantic>=2.10.0",
     "python-dotenv>=1.0.0",
     "keyring>=25.7.0",
+    "asyncssh>=2.17",
 ]
 
 [project.urls]

@@ -1,6 +1,6 @@
-"""FortiOS 7.6.6 MCP Server — Complete REST API implementation.
+"""FortiOS MCP Server — Complete REST API implementation.
 
-This server exposes the entire Fortinet FortiOS 7.6.6 REST API
+This server exposes the entire Fortinet FortiOS REST API (written against 7.6.6)
 (1536 endpoints across CMDB, Monitor, Log, and Service sections)
 as Model Context Protocol tools.
 
@@ -15,6 +15,9 @@ Configuration (environment variables or .env file):
     FORTIOS_VDOM       — VDOM (default: root)
     FORTIOS_VERIFY_SSL — true/false (default: false for self-signed)
     FORTIOS_TIMEOUT    — HTTP timeout in seconds (default: 30)
+    FORTIOS_REDACT     — true/false (default: true) redact secrets in every response
+
+Author: Ehsan Emad (CyberKnightLabs)
 """
 
 from __future__ import annotations
@@ -29,10 +32,13 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 from fortios_client import FortiOSClient
+from ssh_runner import FortiSSH
 from manager_credentials import get_managed_config
 
 # ── Tool modules ──────────────────────────────────────────────────────
 from tools import (
+    diagnostics,
+    extended,
     generic,
     system,
     firewall,
@@ -85,6 +91,12 @@ def _get_config() -> dict:
         "verify_ssl": os.environ.get("FORTIOS_VERIFY_SSL", "false").lower()
         in ("1", "true", "yes"),
         "timeout": float(os.environ.get("FORTIOS_TIMEOUT", "30")),
+        # optional SSH for diagnostics (debug / packet capture)
+        "ssh_host": os.environ.get("FORTIOS_SSH_HOST") or None,
+        "ssh_port": int(os.environ.get("FORTIOS_SSH_PORT", "22")),
+        "ssh_username": os.environ.get("FORTIOS_SSH_USERNAME") or None,
+        "ssh_password": os.environ.get("FORTIOS_SSH_PASSWORD") or None,
+        "ssh_known_hosts": os.environ.get("FORTIOS_SSH_KNOWN_HOSTS") or None,
     }
 
 
@@ -109,10 +121,19 @@ async def lifespan(server: FastMCP) -> AsyncGenerator[dict, None]:
         vdom=cfg["vdom"],
         verify_ssl=cfg["verify_ssl"],
         timeout=cfg["timeout"],
+        redact_output=os.environ.get("FORTIOS_REDACT", "true").lower() not in ("0", "false", "no"),
     )
+    ssh = FortiSSH(
+        host=cfg.get("ssh_host"),
+        port=int(cfg.get("ssh_port") or 22),
+        username=cfg.get("ssh_username"),
+        password=cfg.get("ssh_password"),
+        known_hosts=cfg.get("ssh_known_hosts"),
+    )
+    logger.info("SSH diagnostics %s.", "enabled" if ssh.configured else "not configured (run ssh_setup.py)")
     async with client:
         logger.info("FortiOS client initialized.")
-        yield {"client": client}
+        yield {"client": client, "ssh": ssh}
     logger.info("FortiOS client closed.")
 
 
@@ -125,12 +146,22 @@ mcp = FastMCP(
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
     port=int(os.environ.get("MCP_PORT", "8000")),
     instructions=(
-        "You are connected to a Fortinet FortiGate running FortiOS 7.6.6. "
+        "You are connected to a Fortinet FortiGate (FortiOS 7.x). "
+        "Call device_info for the real model, serial and FortiOS version; do not assume a version. "
         "This server exposes the complete FortiOS REST API as MCP tools. "
         "\n\n"
         "Tool categories:\n"
         "- **Generic**: cmdb_list/get/create/update/delete, monitor_get/action, log_get, service_call\n"
         "    → These cover ALL 1536 FortiOS API endpoints directly.\n"
+        "- **Extended**: device_info (live version/model/serial), cmdb_schema (field schema from the device), "
+        "cmdb_patch (change only given fields: dry run diff, then write + read-back verify), "
+        "cmdb_exists, cmdb_move and cmdb_clone (dry run by default, verified), api_directory (discover endpoints), "
+        "log_search (POST log queries). cmdb_get/cmdb_list accept read options in 'params' "
+        "(datasource, with_meta, skip, scope, exclude-default-values, key/pattern, action=schema|meta|revision).\n"
+        "- **Diagnostics (SSH)**: cpu_usage, diag_command (read-only allowlist), debug_flow, debug_ike, "
+        "debug_application, packet_capture, debug_reset. Enforced: CPU check first (debug refused at >=95%, "
+        "capture at >=90%), filters required, max 10 packets (100 when CPU <50%), debug always disabled at the end. "
+        "Interactive: tell the user to generate the traffic before you call a debug or capture tool.\n"
         "- **System**: interfaces, DNS, NTP, admins, DHCP, SNMP, certificates, VDOMs\n"
         "- **Firewall**: policies, addresses, services, VIPs, IP pools, schedules, sessions\n"
         "- **VPN**: IPsec Phase 1/2, SSL VPN portals/settings, tunnel control, certificates\n"
@@ -141,6 +172,9 @@ mcp = FastMCP(
         "- **Security**: IPS, AV, webfilter, app control, DLP, email filter, DNS filter, WAF, ZTNA\n"
         "- **Wireless**: APs, SSIDs, Hotspot 2.0, connected clients, rogue AP detection\n"
         "\n"
+        "Secret values (passwords, PSKs, keys, ENC values) are redacted as <REDACTED> in every response "
+        "and can never be written back. "
+        "Prefer cmdb_patch over cmdb_update for changing existing objects. "
         "Always use specific typed tools when available. "
         "Fall back to generic cmdb_list/cmdb_get/monitor_get for unlisted resources. "
         "For destructive operations (delete, policy changes), confirm with the user first."
@@ -152,6 +186,8 @@ mcp = FastMCP(
 # Register all tool modules
 # ─────────────────────────────────────────────────────────────────────
 
+diagnostics.register(mcp)
+extended.register(mcp)
 generic.register(mcp)
 system.register(mcp)
 firewall.register(mcp)
@@ -163,7 +199,7 @@ log.register(mcp)
 security.register(mcp)
 wireless.register(mcp)
 
-logger.info("All 10 tool modules registered (240 tools).")
+logger.info("All 12 tool modules registered (255 tools).")
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -1,8 +1,16 @@
-"""Load FortiGate device settings from MCP Manager and OS Keychain."""
+"""Load FortiGate device settings from MCP Manager and OS Keychain.
+
+Author: Ehsan Emad (CyberKnightLabs)
+"""
 
 import json
 import os
 from pathlib import Path
+
+
+CONFIG_DIR = Path.home() / ".config" / "fortigate-mcp-manager"
+SSH_SERVICE = "fortigate-mcp-manager-ssh"
+KNOWN_HOSTS = CONFIG_DIR / "known_hosts"
 
 
 def get_managed_config(device_name=None):
@@ -53,7 +61,19 @@ def get_managed_config(device_name=None):
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
 
+    # Optional SSH access for diagnostics (debug / packet capture). The password
+    # lives only in the Keychain (service fortigate-mcp-manager-ssh), set by the
+    # user with `python ssh_setup.py <device>`.
+    ssh = {
+        "ssh_host": device["host"],
+        "ssh_port": int(device.get("ssh_port", 22)),
+        "ssh_username": device.get("ssh_username"),
+        "ssh_password": keyring.get_password(SSH_SERVICE, device_name),
+        "ssh_known_hosts": str(KNOWN_HOSTS) if KNOWN_HOSTS.is_file() else None,
+    }
+
     return {
+        **ssh,
         "host": f"https://{host}:{device['port']}",
         "api_token": token,
         "vdom": device["default_vdom"],

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""FortiGate MCP Manager — interactive setup wizard."""
+"""FortiGate MCP Manager — interactive setup wizard.
+
+Author: Ehsan Emad (CyberKnightLabs)
+"""
 
 import json
 from pathlib import Path
@@ -10,6 +13,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 MENU = """
 ====================================================
                FORTIGATE MCP MANAGER
+            by Ehsan Emad - CyberKnightLabs
 ====================================================
 
  1. Set / Edit MCP Location
@@ -246,6 +250,19 @@ def add_fortigate_device():
         "timeout": timeout
     }
 
+    print("\n---------- SSH access (SSH module) ----------")
+    print("SSH enables the troubleshooting tools that have no REST API: flow / IKE /")
+    print("application debug, packet capture and read-only diagnose commands.")
+    print("You will be asked for the SSH port, username and password (hidden).")
+    ssh_answer = input("Configure SSH access now? [Y/n]: ").strip().lower()
+    ssh_ok = False
+    if ssh_answer in ("", "y", "yes"):
+        from ssh_setup import configure_ssh
+
+        ssh_ok = configure_ssh(name, devices[name])
+        if not ssh_ok:
+            print("[INFO] Continuing without SSH. Add it later: Manage FortiGate Devices > Configure SSH Access.")
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary_path = None
     try:
@@ -274,6 +291,10 @@ def add_fortigate_device():
     print(f"\n[OK] FortiGate '{name}' registered.")
     print("[OK] API token stored in OS credential manager.")
     print(f"[OK] Default VDOM: {vdom}")
+    if ssh_ok:
+        print(f"[OK] SSH access: {devices[name]['ssh_username']} on port {devices[name]['ssh_port']}")
+    else:
+        print("[INFO] SSH access: not configured (debug / packet capture tools disabled).")
     print("[INFO] API connectivity has not been tested yet.")
 
 
@@ -357,8 +378,14 @@ def list_fortigate_devices(devices):
         print(f"Verify SSL:   {device['verify_ssl']}")
         print(f"CA Cert:      {device.get('ca_cert') or 'Default'}")
         print(f"Timeout:      {device['timeout']} seconds")
+        try:
+            from ssh_setup import ssh_status
 
-    print("\n[INFO] API tokens are never displayed.")
+            print(f"SSH:          {ssh_status(name, device)}")
+        except ImportError:
+            print("SSH:          unknown (run the manager from the project virtualenv)")
+
+    print("\n[INFO] API tokens and SSH passwords are never displayed.")
 
 
 def edit_fortigate_device(config):
@@ -462,6 +489,9 @@ def edit_fortigate_device(config):
 
     if save_device_config(config):
         print(f"[OK] Device '{name}' updated.")
+        if updated["host"] != current["host"] and current.get("ssh_username"):
+            print("[WARNING] The management address changed: run 'Configure SSH Access' again so the")
+            print("          new SSH host key is confirmed and saved.")
 
 
 def update_fortigate_token(config):
@@ -502,7 +532,7 @@ def remove_fortigate_device(config):
         return
 
     confirm = input(
-        f"Type DELETE to remove '{name}' and its API token: "
+        f"Type DELETE to remove '{name}', its API token and its SSH access: "
     ).strip()
 
     if confirm != "DELETE":
@@ -517,12 +547,66 @@ def remove_fortigate_device(config):
         print(f"[ERROR] Could not remove credential: {type(exc).__name__}")
         return
 
+    try:
+        from ssh_setup import remove_ssh
+
+        remove_ssh(name, config["devices"][name])
+    except Exception as exc:
+        print(f"[WARNING] Could not remove SSH credentials: {type(exc).__name__}")
+
     del config["devices"][name]
 
     if save_device_config(config):
         print(f"[OK] Device '{name}' removed.")
     else:
         print("[WARNING] Configuration save failed; review device state.")
+
+
+def configure_ssh_access(config):
+    """Add or replace SSH access (port, username, password) for a registered FortiGate."""
+    name = select_fortigate_device(config.get("devices", {}))
+    if name is None:
+        return
+    try:
+        from ssh_setup import configure_ssh
+    except ImportError:
+        print("[ERROR] SSH support needs the project dependencies (asyncssh). Run the manager with")
+        print("        the project virtualenv: .venv/bin/python manager.py")
+        return
+    device = config["devices"][name]
+    print(f"\nSSH access for {name} ({device['host']})")
+    print("Use a dedicated admin with Trusted Hosts; the password is stored in the OS credential manager.")
+    if configure_ssh(name, device) and save_device_config(config):
+        print(f"[OK] SSH access saved for '{name}'. Restart the AI client to enable the diagnostics tools.")
+
+
+def change_ssh_password(config):
+    """Replace the stored SSH password after it was changed on the FortiGate."""
+    name = select_fortigate_device(config.get("devices", {}))
+    if name is None:
+        return
+    try:
+        from ssh_setup import change_ssh_password as change
+    except ImportError:
+        print("[ERROR] SSH support needs the project dependencies (asyncssh). Run: uv run python manager.py")
+        return
+    if change(name, config["devices"][name]):
+        print(f"[OK] SSH password updated for '{name}'. Restart the AI client so it uses the new password.")
+
+
+def remove_ssh_access(config):
+    """Remove SSH access (Keychain password, host key, username/port) for a FortiGate."""
+    name = select_fortigate_device(config.get("devices", {}))
+    if name is None:
+        return
+    from ssh_setup import remove_ssh
+
+    if input(f"Remove SSH access for '{name}'? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("[INFO] Cancelled.")
+        return
+    remove_ssh(name, config["devices"][name])
+    if save_device_config(config):
+        print(f"[OK] SSH access removed for '{name}'.")
 
 
 def manage_fortigate_devices():
@@ -535,6 +619,9 @@ def manage_fortigate_devices():
  2. Edit Device Settings
  3. Update API Token
  4. Remove Device
+ 5. Configure SSH Access (port, username, password)
+ 6. Change SSH Password
+ 7. Remove SSH Access
  0. Back to Main Menu
 """)
 
@@ -555,6 +642,12 @@ def manage_fortigate_devices():
             update_fortigate_token(config)
         elif choice == "4":
             remove_fortigate_device(config)
+        elif choice == "5":
+            configure_ssh_access(config)
+        elif choice == "6":
+            change_ssh_password(config)
+        elif choice == "7":
+            remove_ssh_access(config)
         else:
             print("[ERROR] Invalid option.")
 
@@ -695,6 +788,17 @@ def test_fortigate_connectivity():
         print(f"[WARNING] VDOM API request returned HTTP {exc.code}.")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
         print("[WARNING] Could not complete VDOM API check.")
+
+    if device.get("ssh_username"):
+        try:
+            from ssh_setup import test_ssh
+
+            ok, message = test_ssh(name, device)
+            print(f"[OK] SSH login succeeded ({message})." if ok else f"[WARNING] {message}.")
+        except ImportError:
+            print("[WARNING] SSH test skipped: run the manager from the project virtualenv.")
+    else:
+        print("[INFO] SSH not configured (optional; needed for debug / packet capture).")
 
     print("\n[OK] Connectivity test completed.")
 

@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from pydantic import Field
 
 from fortios_client import FortiOSClient, FortiOSError
+from query_params import ParamError, parse_read_params
 
 
 def register(mcp: FastMCP) -> None:  # noqa: C901
@@ -63,6 +64,18 @@ def register(mcp: FastMCP) -> None:  # noqa: C901
                 description="Comma-separated list of fields to return. Reduces response size.",
             ),
         ] = None,
+        params: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Optional JSON object of extra read options: datasource, with_meta, with_contents_hash, "
+                    "skip, exclude-default-values, scope (global|vdom|both), key + pattern, format, filter, "
+                    "start, count, action (default|meta|schema|revision). "
+                    'Example: \'{"with_meta": true, "scope": "global"}\''
+                ),
+            ),
+        ] = None,
         vdom: Annotated[
             str | None,
             Field(
@@ -77,17 +90,21 @@ def register(mcp: FastMCP) -> None:  # noqa: C901
         Returns the full FortiOS JSON response including results array and metadata.
         """
         client: FortiOSClient = ctx.request_context.lifespan_context["client"]
-        params: dict[str, Any] = {}
+        query: dict[str, Any] = {}
         if filters:
-            params["filter"] = filters
+            query["filter"] = filters
         if start is not None:
-            params["start"] = start
+            query["start"] = start
         if count is not None:
-            params["count"] = count
+            query["count"] = count
         if format_fields:
-            params["format"] = format_fields
+            query["format"] = format_fields
         try:
-            return await client.cmdb_get(resource_path, params or None, vdom=vdom)
+            query.update(parse_read_params(params) or {})
+        except ParamError as exc:
+            return {"error": str(exc)}
+        try:
+            return await client.cmdb_get(resource_path, query or None, vdom=vdom)
         except FortiOSError as exc:
             await ctx.error(f"cmdb_list error: {exc}")
             return {"error": str(exc), "status_code": exc.status_code}
@@ -105,6 +122,18 @@ def register(mcp: FastMCP) -> None:  # noqa: C901
                 )
             ),
         ],
+        params: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Optional JSON object of extra read options: datasource, with_meta, with_contents_hash, "
+                    "skip, exclude-default-values, scope (global|vdom|both), key + pattern, format, filter, "
+                    "start, count, action (default|meta|schema|revision). "
+                    'Example: \'{"with_meta": true, "scope": "global"}\''
+                ),
+            ),
+        ] = None,
         vdom: Annotated[
             str | None,
             Field(
@@ -115,11 +144,15 @@ def register(mcp: FastMCP) -> None:  # noqa: C901
     ) -> dict[str, Any]:
         """Get a single CMDB configuration object by its primary key.
 
-        Covers any GET on /api/v2/cmdb/{resource}/{key}.
+        Covers any GET on /api/v2/cmdb/{resource}/{key}. Optional read options in ``params``.
         """
         client: FortiOSClient = ctx.request_context.lifespan_context["client"]
         try:
-            return await client.cmdb_get(resource_path, vdom=vdom)
+            query = parse_read_params(params)
+        except ParamError as exc:
+            return {"error": str(exc)}
+        try:
+            return await client.cmdb_get(resource_path, query, vdom=vdom)
         except FortiOSError as exc:
             await ctx.error(f"cmdb_get error: {exc}")
             return {"error": str(exc), "status_code": exc.status_code}
